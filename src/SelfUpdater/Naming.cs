@@ -29,17 +29,29 @@ public delegate (SemVersion Version, string Rid)? AssetNameParser(string name);
 internal static class AssetNaming
 {
     /// <summary>
-    /// The default <c>{appName}-{version}-{rid}</c> parser. The known
-    /// <c>{appName}-</c> prefix and <c>-{rid}</c> suffix are stripped and whatever
-    /// remains — dashes and all — is parsed as the version. Names that don't fit, or
-    /// whose version segment doesn't parse, are skipped.
+    /// Archive extensions recognized by the default convention. A multi-file release
+    /// ships as one of these (e.g. a macOS <c>.app</c> bundle zipped to
+    /// <c>myapp-1.2.3-osx-arm64.zip</c>); the extension is stripped before the
+    /// <c>{appName}-{version}-{rid}</c> match so archives and bare binaries share a
+    /// naming scheme. Longest/compound extensions come first.
+    /// </summary>
+    private static readonly string[] ArchiveExtensions = [".tar.gz", ".tgz", ".zip"];
+
+    /// <summary>
+    /// The default <c>{appName}-{version}-{rid}</c> parser. Any known archive
+    /// extension is stripped first, then the known <c>{appName}-</c> prefix and
+    /// <c>-{rid}</c> suffix are removed and whatever remains — dashes and all — is
+    /// parsed as the version. Names that don't fit, or whose version segment doesn't
+    /// parse, are skipped.
     /// </summary>
     public static AssetNameParser DefaultParser(string appName, string rid)
     {
         var prefix = appName + "-";
         var suffix = "-" + rid;
-        return name =>
+        return rawName =>
         {
+            var name = StripArchiveExtension(rawName);
+
             // Must contain at least one version character between prefix and suffix.
             if (name.Length <= prefix.Length + suffix.Length)
                 return null;
@@ -54,6 +66,17 @@ internal static class AssetNaming
                 ? (version, rid)
                 : null;
         };
+    }
+
+    /// <summary>Drop a recognized archive extension (case-insensitive), if present.</summary>
+    private static string StripArchiveExtension(string name)
+    {
+        foreach (var ext in ArchiveExtensions)
+        {
+            if (name.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+                return name[..^ext.Length];
+        }
+        return name;
     }
 
     /// <summary>

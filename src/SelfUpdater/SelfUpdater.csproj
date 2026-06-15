@@ -12,7 +12,7 @@
 
     <!-- Package metadata -->
     <PackageId>SelfUpdater</PackageId>
-    <Version>0.3.0</Version>
+    <Version>0.4.0</Version>
     <Authors>Andy Gocke</Authors>
     <Description>A small, pluggable self-update engine for single-file .NET apps. Checks a version, downloads the matching build, verifies and validates it, then replaces the running executable in place. Where updates come from is pluggable (GitHub releases, a directory/share, or your own source).</Description>
     <PackageTags>self-update;updater;single-file;aot;auto-update</PackageTags>
