@@ -1,3 +1,5 @@
+using System.Formats.Tar;
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using SelfUpdater;
@@ -323,6 +325,151 @@ public class SelfUpdaterTests
         await using var _ = await source.OpenAssetAsync(asset, default);
         Assert.Contains("application/octet-stream", seenAccept);
         Assert.Equal("Bearer tok-123", seenAuth);
+    }
+
+    [Fact]
+    public async Task DefaultConvention_AcceptsArchiveExtensions()
+    {
+        // Multi-file releases ship as archives; the default convention strips a known
+        // archive extension before matching {appName}-{version}-{rid}.
+        const string json = """
+            [
+              {
+                "tag_name": "v1.2.3",
+                "assets": [
+                  { "name": "app-1.2.3-osx-arm64.zip", "browser_download_url": "https://dl/osx" },
+                  { "name": "app-1.2.3-linux-x64.tar.gz", "browser_download_url": "https://dl/linux" }
+                ]
+              }
+            ]
+            """;
+        var updater = new GitHubUpdater("agocke", "app", Options("0.0.0"), http: StubClient(json));
+
+        var release = Assert.Single(await updater.GetReleasesAsync());
+
+        Assert.Equal(V("1.2.3"), release.Version);
+        // The osx archive is selected for the configured rid; its full name is preserved.
+        Assert.Equal("app-1.2.3-osx-arm64.zip", release.Asset.Name);
+        Assert.Equal("https://dl/osx", release.Asset.Location);
+    }
+
+    [Fact]
+    public void ApplySwap_DirectoryMode_ReplacesTreeDropsStaleAndPreservesModes()
+    {
+        var root = Directory.CreateTempSubdirectory("selfupdater-swap-").FullName;
+        try
+        {
+            var dest = Path.Combine(root, "install", "MyApp.app");
+            var staged = Path.Combine(root, "staged", "MyApp.app");
+
+            // Old install: an executable, a plist, and a stale file the update drops.
+            WriteFile(Path.Combine(dest, "Contents", "MacOS", "app"), "old", executable: true);
+            WriteFile(Path.Combine(dest, "Contents", "Info.plist"), "old-plist");
+            WriteFile(Path.Combine(dest, "Contents", "MacOS", "stale.txt"), "stale");
+
+            // Staged build: new exe contents, a new resource, and no stale file.
+            WriteFile(Path.Combine(staged, "Contents", "MacOS", "app"), "new", executable: true);
+            WriteFile(Path.Combine(staged, "Contents", "Info.plist"), "new-plist");
+            WriteFile(Path.Combine(staged, "Contents", "Resources", "data.bin"), "data");
+
+            var code = Updater.ApplySwap(
+                dest,
+                oldPid: 0,
+                relaunchArgs: null,
+                sourceDir: staged,
+                log: TextWriter.Null
+            );
+
+            Assert.Equal(0, code);
+            Assert.Equal("new", File.ReadAllText(Path.Combine(dest, "Contents", "MacOS", "app")));
+            Assert.Equal(
+                "new-plist",
+                File.ReadAllText(Path.Combine(dest, "Contents", "Info.plist"))
+            );
+            Assert.True(File.Exists(Path.Combine(dest, "Contents", "Resources", "data.bin")));
+            // Files present only in the old tree are gone after the swap.
+            Assert.False(File.Exists(Path.Combine(dest, "Contents", "MacOS", "stale.txt")));
+            // No backup directory left behind on success.
+            Assert.False(Directory.Exists(dest + ".bak"));
+
+            if (!OperatingSystem.IsWindows())
+            {
+                var mode = File.GetUnixFileMode(Path.Combine(dest, "Contents", "MacOS", "app"));
+                Assert.True(mode.HasFlag(UnixFileMode.UserExecute));
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("MyApp-1.2.3-osx-arm64.zip")]
+    [InlineData("MyApp-1.2.3-osx-arm64.tar.gz")]
+    [InlineData("MyApp-1.2.3-osx-arm64.tgz")]
+    public void ExtractArchive_DispatchesOnExtension_PreservingTreeAndModes(string archiveName)
+    {
+        var root = Directory.CreateTempSubdirectory("selfupdater-extract-").FullName;
+        try
+        {
+            // A bundle-like source tree with an executable, a nested resource, and a plist.
+            var src = Path.Combine(root, "MyApp.app");
+            WriteFile(Path.Combine(src, "Contents", "MacOS", "app"), "bin", executable: true);
+            WriteFile(Path.Combine(src, "Contents", "Info.plist"), "plist");
+            WriteFile(Path.Combine(src, "Contents", "Resources", "data.bin"), "data");
+
+            var archive = Path.Combine(root, archiveName);
+            if (archiveName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+            {
+                ZipFile.CreateFromDirectory(
+                    src,
+                    archive,
+                    CompressionLevel.Optimal,
+                    includeBaseDirectory: true
+                );
+            }
+            else
+            {
+                using var file = File.Create(archive);
+                using var gzip = new GZipStream(file, CompressionLevel.Optimal);
+                TarFile.CreateFromDirectory(src, gzip, includeBaseDirectory: true);
+            }
+
+            var extractDir = Path.Combine(root, "extracted");
+            Updater.ExtractArchive(archive, extractDir);
+
+            // Single top-level directory (the bundle), with all files intact.
+            var top = Path.Combine(extractDir, "MyApp.app");
+            Assert.Equal("bin", File.ReadAllText(Path.Combine(top, "Contents", "MacOS", "app")));
+            Assert.Equal("plist", File.ReadAllText(Path.Combine(top, "Contents", "Info.plist")));
+            Assert.True(File.Exists(Path.Combine(top, "Contents", "Resources", "data.bin")));
+
+            if (!OperatingSystem.IsWindows())
+            {
+                var mode = File.GetUnixFileMode(Path.Combine(top, "Contents", "MacOS", "app"));
+                Assert.True(mode.HasFlag(UnixFileMode.UserExecute));
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static void WriteFile(string path, string content, bool executable = false)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, content);
+        if (executable && !OperatingSystem.IsWindows())
+        {
+            var mode =
+                File.GetUnixFileMode(path)
+                | UnixFileMode.UserExecute
+                | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherExecute;
+            File.SetUnixFileMode(path, mode);
+        }
     }
 
     private static SemVersion V(string value) => SemVersion.Parse(value, SemVersionStyles.Any);

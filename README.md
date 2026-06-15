@@ -7,7 +7,9 @@ check the running version against a source, download the build for your platform
 verify (SHA-256, when the source publishes a hash) and optionally
 validate (smoke-test) it, then replace the running executable **in place** via a
 two-process handoff so an app can update itself — including on Windows, where a
-running image can't overwrite itself.
+running image can't overwrite itself. Single-file binaries and multi-file bundles
+(e.g. a macOS `.app`) are both supported — see
+[Directory (multi-file) updates](#directory-multi-file-updates).
 
 ## Install
 
@@ -105,12 +107,40 @@ Wire that command up once:
 ```csharp
 // e.g. with System.CommandLine — names come from Updater constants
 // Updater.HandoffVerb ("apply-update"), Updater.DestOption ("--dest"),
-// Updater.PidOption ("--pid"), Updater.RelaunchOption ("--relaunch")
+// Updater.PidOption ("--pid"), Updater.RelaunchOption ("--relaunch"),
+// Updater.SourceDirOption ("--source-dir", directory updates only)
 if (args is [Updater.HandoffVerb, ..])
 {
-    return Updater.ApplySwap(destPath, oldPid, relaunchArgs: null);
+    // sourceDir is null for single-file updates; pass it through for directory ones.
+    return Updater.ApplySwap(destPath, oldPid, relaunchArgs: null, sourceDir: sourceDir);
 }
 ```
+
+### Directory (multi-file) updates
+
+Some apps are not a single file — a macOS `.app` bundle, or a binary that ships
+sidecar native assets next to it. Set `TargetDirectory` and the engine treats the
+release asset as a `.zip` or `.tar.gz`/`.tgz` containing one top-level directory, and
+replaces the whole tree in place instead of one file:
+
+```csharp
+var updater = new GitHubUpdater("you", "myapp", new UpdaterOptions
+{
+    AppName = "myapp",
+    CurrentVersion = current,
+    // The directory to replace wholesale. The running executable must live inside
+    // it (e.g. MyApp.app/Contents/MacOS/myapp); its location relative to the root is
+    // reused to launch the staged build and to relaunch after the swap.
+    TargetDirectory = bundleRoot,
+});
+```
+
+The release asset is named the same way — `{appName}-{version}-{rid}.<ext>` — the
+default convention strips a known archive extension (`.zip`, `.tgz`, `.tar.gz`)
+before matching, and extraction dispatches on that extension (`.tar.gz`/`.tgz` are
+extracted as gzipped tar, everything else as zip). Executable bits inside the archive
+are preserved on extraction, so the swapped-in tree stays runnable. The handoff is
+identical; just forward the `--source-dir` value (above) to `ApplySwap`.
 
 ### Private GitHub repos
 
