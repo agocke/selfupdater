@@ -164,7 +164,7 @@ public sealed record UpdaterOptions
 /// the engine owns naming, platform selection, and the "newest wins" comparison.
 /// </para>
 /// </summary>
-public abstract class Updater
+public abstract partial class Updater
 {
     // Wire contract for the handoff (new-process) side. The host app registers a
     // command/handler with these exact names; keeping them here makes this the
@@ -401,7 +401,7 @@ public abstract class Updater
             );
         }
 
-        _log.WriteLine($"Installed {release.Version}; {CurrentFileName} now points at it.");
+        _log.WriteLine($"Installed {release.Version}; {CurrentName} now points at it.");
         SweepOldVersions(installRoot, release.Version.ToString(), exePath, _log);
 
         // No handoff here: nothing in use was replaced, so the new build can simply be
@@ -426,34 +426,42 @@ public abstract class Updater
     }
 
     /// <summary>
-    /// Name of the pointer file naming the active version, directly under the install
-    /// root. A plain file rather than a symlink because replacing one file is the only
-    /// atomic operation every platform agrees on: <c>rename()</c> on POSIX,
-    /// <c>MoveFileEx(MOVEFILE_REPLACE_EXISTING)</c> on Windows.
+    /// Name of the pointer at the install root that selects the active version. On POSIX
+    /// this is a <b>symlink</b> to the version directory, flipped with <c>rename(2)</c>;
+    /// on Windows, where symlinks need admin, it is a small file naming the version,
+    /// replaced with <c>MoveFileEx(MOVEFILE_REPLACE_EXISTING)</c>. Either way it is one
+    /// pointer, replaced atomically — never two representations that can disagree.
     /// </summary>
-    public const string CurrentFileName = "current.version";
-
-    /// <summary>
-    /// Name of the convenience symlink to the active version directory, maintained on
-    /// POSIX only and on a best-effort basis, so a launcher can use a stable path (e.g.
-    /// systemd's <c>ExecStart=/opt/app/current/app</c>). <see cref="CurrentFileName"/>
-    /// remains the source of truth; the link is rebuilt from it, not the other way round.
-    /// </summary>
-    public const string CurrentLinkName = "current";
+    public static string CurrentName => OperatingSystem.IsWindows() ? "current.version" : "current";
 
     private const string VersionsDirName = "versions";
     private const string StagingPrefix = ".staging-";
 
     /// <summary>
     /// The directory holding the active version of a versioned install, or <c>null</c>
-    /// when the install root has no usable pointer. Call this at launch to resolve what
-    /// to run; see <see cref="UpdaterOptions.InstallRoot"/> for the layout.
+    /// when the install root has no usable pointer. See <see cref="UpdaterOptions.InstallRoot"/>
+    /// for the layout.
+    /// <para>
+    /// On POSIX you rarely need this: the pointer is a symlink, so a launcher can simply
+    /// use <c>&lt;InstallRoot&gt;/current/app</c> as a stable path (a systemd
+    /// <c>ExecStart=</c>, say) and never call into this library. It exists mainly for
+    /// Windows, where <see cref="RunLauncher"/> uses it.
+    /// </para>
     /// </summary>
     public static string? ResolveCurrent(string installRoot)
     {
         try
         {
-            var pointer = Path.Combine(installRoot, CurrentFileName);
+            var pointer = Path.Combine(installRoot, CurrentName);
+            if (!OperatingSystem.IsWindows())
+            {
+                // The symlink is the pointer; resolve it rather than reading anything.
+                var info = new DirectoryInfo(pointer);
+                return info.LinkTarget is not null && info.Exists
+                    ? info.ResolveLinkTarget(true)?.FullName
+                    : null;
+            }
+
             if (!File.Exists(pointer))
                 return null;
             var version = File.ReadAllText(pointer).Trim();
@@ -471,8 +479,7 @@ public abstract class Updater
     /// <summary>
     /// Where <paramref name="exePath"/> sits relative to its version directory, or
     /// <c>null</c> when it is not inside the install at all. Both launch paths are
-    /// accepted: straight out of <c>versions/&lt;v&gt;</c>, or through the
-    /// <see cref="CurrentLinkName"/> symlink.
+    /// accepted: straight out of <c>versions/&lt;v&gt;</c>, or through the pointer.
     /// </summary>
     private static string? RelativeExePath(string installRoot, string? exePath)
     {
@@ -480,7 +487,7 @@ public abstract class Updater
             return null;
         var full = Path.GetFullPath(exePath);
 
-        var bases = new List<string> { Path.Combine(installRoot, CurrentLinkName) };
+        var bases = new List<string> { Path.Combine(installRoot, CurrentName) };
         var versionsDir = Path.Combine(installRoot, VersionsDirName);
         if (Directory.Exists(versionsDir))
             bases.AddRange(Directory.GetDirectories(versionsDir));
@@ -501,62 +508,228 @@ public abstract class Updater
     }
 
     /// <summary>
-    /// Point the install at <paramref name="version"/>. Writes a temporary file and moves
-    /// it over the pointer, so a reader sees either the old version or the new one.
+    /// Point the install at <paramref name="version"/>, atomically: a reader sees either
+    /// the old version or the new one, never neither. This is the only operation in an
+    /// update that has to be atomic, and the only one that changes what the app resolves
+    /// to.
     /// </summary>
     private static bool SetCurrent(string installRoot, string version, TextWriter log)
     {
-        var pointer = Path.Combine(installRoot, CurrentFileName);
+        var pointer = Path.Combine(installRoot, CurrentName);
         var tmp = pointer + ".tmp";
         try
         {
-            File.WriteAllText(tmp, version);
-            File.Move(tmp, pointer, overwrite: true);
+            if (OperatingSystem.IsWindows())
+            {
+                File.WriteAllText(tmp, version);
+                File.Move(tmp, pointer, overwrite: true);
+                return true;
+            }
+
+            // Refuse to replace a real directory that happens to sit at the pointer's
+            // name — that is someone else's data, not a pointer we own.
+            var existing = new DirectoryInfo(pointer);
+            if (existing.Exists && existing.LinkTarget is null)
+            {
+                log.WriteLine(
+                    $"{CurrentName} is a real directory, not a symlink; refusing to replace it."
+                );
+                return false;
+            }
+
+            TryDelete(tmp);
+            Directory.CreateSymbolicLink(tmp, Path.Combine(VersionsDirName, version));
+            // rename(2) replaces the existing link in one step. The BCL cannot do this:
+            // File.Move rejects a directory symlink (File.Exists is false for one) and
+            // Directory.Move refuses to overwrite, so both would leave a window where the
+            // pointer does not exist.
+            if (Rename(tmp, pointer) != 0)
+            {
+                var err = Marshal.GetLastPInvokeError();
+                log.WriteLine($"Could not move the {CurrentName} symlink: errno {err}.");
+                TryDelete(tmp);
+                return false;
+            }
+            return true;
         }
         catch (Exception e)
         {
-            log.WriteLine($"Could not write {CurrentFileName}: {e.Message}");
+            log.WriteLine($"Could not update {CurrentName}: {e.Message}");
             TryDelete(tmp);
             return false;
         }
-
-        UpdateCurrentLink(installRoot, version, log);
-        return true;
     }
 
-    /// <summary>
-    /// Rebuild the <see cref="CurrentLinkName"/> symlink. Best effort and POSIX-only:
-    /// failures are logged and ignored, since the pointer file is what actually decides
-    /// the active version. Not atomic (the old link is removed before the new one is
-    /// created), which is why it is a convenience rather than the mechanism.
-    /// </summary>
-    private static void UpdateCurrentLink(string installRoot, string version, TextWriter log)
-    {
-        if (OperatingSystem.IsWindows())
-            return;
+    [LibraryImport(
+        "libc",
+        EntryPoint = "rename",
+        SetLastError = true,
+        StringMarshalling = StringMarshalling.Utf8
+    )]
+    private static partial int Rename(string oldPath, string newPath);
 
-        var link = Path.Combine(installRoot, CurrentLinkName);
-        var target = Path.Combine(VersionsDirName, version);
+    /// <summary>
+    /// Suffix of a staged launcher replacement, promoted by <see cref="RunLauncher"/> on
+    /// its next run. Windows cannot overwrite a running executable, but it <i>can</i>
+    /// rename one, which is what makes the promotion possible.
+    /// </summary>
+    private const string PendingSuffix = ".new";
+
+    /// <summary>Suffix of the outgoing launcher, swept once nothing is running it.</summary>
+    private const string SupersededSuffix = ".old";
+
+    /// <summary>
+    /// Run the active version's executable, as a launcher sitting at a stable path
+    /// outside the version directories. Promotes a staged launcher replacement first (see
+    /// <see cref="StageLauncherReplacement"/>), resolves the pointer, then starts
+    /// <paramref name="relativeExePath"/> inside the active version and waits for it,
+    /// returning its exit code.
+    /// <para>
+    /// This exists for <b>Windows</b>, which has no unprivileged directory symlink, so a
+    /// shortcut or service cannot point at a stable path that follows updates. On POSIX
+    /// the pointer already is a symlink and a launcher is usually redundant — point
+    /// systemd at <c>&lt;InstallRoot&gt;/current/app</c> instead of adding a process.
+    /// </para>
+    /// <para>
+    /// Child stdio is inherited, so console output and Ctrl-C work as if the app had been
+    /// started directly. The launcher does not supervise beyond waiting: if the launcher
+    /// process is killed the child keeps running (a Windows job object would be needed to
+    /// change that, which this deliberately does not set up).
+    /// </para>
+    /// </summary>
+    /// <param name="installRoot">The install root, laid out per <see cref="UpdaterOptions.InstallRoot"/>.</param>
+    /// <param name="relativeExePath">Executable to run, relative to the version directory (e.g. <c>app.exe</c>).</param>
+    /// <param name="args">Arguments forwarded to the app.</param>
+    /// <param name="log">Where to report resolution failures; defaults to <see cref="Console.Error"/>.</param>
+    /// <returns>The app's exit code, or a non-zero code if it could not be started.</returns>
+    public static int RunLauncher(
+        string installRoot,
+        string relativeExePath,
+        IReadOnlyList<string>? args = null,
+        TextWriter? log = null
+    )
+    {
+        log ??= Console.Error;
+        installRoot = Path.GetFullPath(installRoot);
+
+        PromotePendingLauncher(log);
+
+        var dir = ResolveCurrent(installRoot);
+        if (dir is null)
+        {
+            log.WriteLine(
+                $"No active version: {Path.Combine(installRoot, CurrentName)} is missing or does not resolve."
+            );
+            return 69; // EX_UNAVAILABLE
+        }
+
+        var exe = Path.Combine(dir, relativeExePath);
+        if (!File.Exists(exe))
+        {
+            log.WriteLine(
+                $"Active version {Path.GetFileName(dir)} does not contain {relativeExePath}."
+            );
+            return 69;
+        }
+
         try
         {
-            // Only ever remove a symlink; never follow one into a real directory.
-            var info = new DirectoryInfo(link);
-            if (info.Exists || info.LinkTarget is not null)
+            var psi = new ProcessStartInfo { FileName = exe, UseShellExecute = false };
+            foreach (var a in args ?? [])
+                psi.ArgumentList.Add(a);
+
+            using var child = Process.Start(psi);
+            if (child is null)
             {
-                if (info.LinkTarget is null)
-                {
-                    log.WriteLine(
-                        $"{CurrentLinkName} is a real directory, not a symlink; leaving it alone."
-                    );
-                    return;
-                }
-                info.Delete();
+                log.WriteLine($"Could not start {exe}.");
+                return 70; // EX_SOFTWARE
             }
-            Directory.CreateSymbolicLink(link, target);
+            child.WaitForExit();
+            return child.ExitCode;
         }
         catch (Exception e)
         {
-            log.WriteLine($"Could not update the {CurrentLinkName} symlink: {e.Message}");
+            log.WriteLine($"Could not start {exe}: {e.Message}");
+            return 70;
+        }
+    }
+
+    /// <summary>
+    /// Stage a replacement for the launcher at <paramref name="launcherPath"/>, to be
+    /// promoted the next time <see cref="RunLauncher"/> runs. Call this when a release
+    /// ships a newer launcher; the launcher itself lives outside the version directories,
+    /// so a versioned install does not replace it.
+    /// <para>
+    /// The swap is deferred because a running executable cannot be overwritten. It can be
+    /// <i>renamed</i>, though, even on Windows, which is what promotion relies on.
+    /// </para>
+    /// </summary>
+    public static bool StageLauncherReplacement(
+        string launcherPath,
+        string newLauncherPath,
+        TextWriter? log = null
+    )
+    {
+        log ??= Console.Error;
+        try
+        {
+            File.Copy(newLauncherPath, launcherPath + PendingSuffix, overwrite: true);
+            if (!OperatingSystem.IsWindows())
+                Utilities.MakeExecutable(launcherPath + PendingSuffix);
+            return true;
+        }
+        catch (Exception e)
+        {
+            log.WriteLine($"Could not stage a launcher replacement: {e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Promote a staged launcher, if one is waiting: rename the running launcher aside
+    /// and move the replacement into its place. The promoted binary takes effect on the
+    /// <i>next</i> run — this process is already the old image — so this is deliberately
+    /// not followed by a re-exec. Also sweeps a superseded launcher left by an earlier
+    /// promotion, which only succeeds once nothing is running it.
+    /// </summary>
+    private static void PromotePendingLauncher(TextWriter log)
+    {
+        var self = Utilities.ProcessPath;
+        if (string.IsNullOrEmpty(self))
+            return;
+
+        TryDelete(self + SupersededSuffix);
+
+        var pending = self + PendingSuffix;
+        if (!File.Exists(pending))
+            return;
+
+        try
+        {
+            // Renaming a running executable is allowed (deleting one is not), so the old
+            // image gets out of the way without disturbing this process.
+            File.Move(self, self + SupersededSuffix, overwrite: true);
+            File.Move(pending, self, overwrite: true);
+            log.WriteLine("Promoted a staged launcher; it takes effect on the next run.");
+        }
+        catch (Exception e)
+        {
+            log.WriteLine($"Could not promote the staged launcher: {e.Message}");
+            // Put the old launcher back if the second move never happened.
+            if (!File.Exists(self) && File.Exists(self + SupersededSuffix))
+                TryMove(self + SupersededSuffix, self);
+        }
+    }
+
+    private static void TryMove(string from, string to)
+    {
+        try
+        {
+            File.Move(from, to, overwrite: true);
+        }
+        catch (Exception)
+        {
+            // Best effort.
         }
     }
 

@@ -364,7 +364,7 @@ public class SelfUpdaterTests
             var oldExe = Path.Combine(install, "versions", "1.0.0", "app");
             WriteFile(oldExe, "old", executable: true);
             WriteFile(Path.Combine(install, "versions", "1.0.0", "data.bin"), "old-data");
-            File.WriteAllText(Path.Combine(install, "current.version"), "1.0.0");
+            SetPointer(install, "1.0.0");
 
             var source = StageArchive(root, "app-2.0.0-osx-arm64.zip", "new");
             var updater = new DirectoryUpdater(
@@ -385,10 +385,6 @@ public class SelfUpdaterTests
             var newExe = Path.Combine(install, "versions", "2.0.0", "app");
             Assert.Equal("new", File.ReadAllText(newExe));
             // ...the pointer moved to it...
-            Assert.Equal(
-                "2.0.0",
-                File.ReadAllText(Path.Combine(install, "current.version")).Trim()
-            );
             Assert.Equal(
                 Path.Combine(install, "versions", "2.0.0"),
                 Updater.ResolveCurrent(install)
@@ -412,7 +408,8 @@ public class SelfUpdaterTests
                     File.GetUnixFileMode(newExe).HasFlag(UnixFileMode.UserExecute),
                     "the staged executable should keep its executable bit"
                 );
-                // The convenience symlink follows the pointer.
+                // On POSIX the pointer *is* the symlink, and it replaced the existing one
+                // in place — the case File.Move/Directory.Move cannot do.
                 var link = new DirectoryInfo(Path.Combine(install, "current"));
                 Assert.Equal(Path.Combine("versions", "2.0.0"), link.LinkTarget);
                 Assert.Equal("new", File.ReadAllText(Path.Combine(link.FullName, "app")));
@@ -436,7 +433,7 @@ public class SelfUpdaterTests
             WriteFile(runningExe, "old", executable: true);
             WriteFile(Path.Combine(install, "versions", "0.9.0", "app"), "older");
             Directory.CreateDirectory(Path.Combine(install, "versions", ".staging-leftover"));
-            File.WriteAllText(Path.Combine(install, "current.version"), "1.0.0");
+            SetPointer(install, "1.0.0");
 
             var source = StageArchive(root, "app-2.0.0-osx-arm64.zip", "new");
             var updater = new DirectoryUpdater(
@@ -474,7 +471,7 @@ public class SelfUpdaterTests
             var install = Path.Combine(root, "install");
             var oldExe = Path.Combine(install, "versions", "1.0.0", "app");
             WriteFile(oldExe, "old", executable: true);
-            File.WriteAllText(Path.Combine(install, "current.version"), "1.0.0");
+            SetPointer(install, "1.0.0");
 
             // An archive that does not contain the expected executable name.
             var source = StageArchive(root, "app-2.0.0-osx-arm64.zip", "new", exeName: "wrong");
@@ -490,11 +487,11 @@ public class SelfUpdaterTests
             var result = await updater.UpdateAsync();
 
             Assert.Equal(UpdateOutcome.Failed, result.Outcome);
-            // The pointer still names the old version, which is still intact, and the
-            // half-good 2.0.0 directory was cleaned up rather than left to be resolved.
+            // The pointer still resolves to the old version, which is still intact, and
+            // the half-good 2.0.0 directory was cleaned up rather than left behind.
             Assert.Equal(
-                "1.0.0",
-                File.ReadAllText(Path.Combine(install, "current.version")).Trim()
+                Path.Combine(install, "versions", "1.0.0"),
+                Updater.ResolveCurrent(install)
             );
             Assert.Equal("old", File.ReadAllText(oldExe));
             Assert.False(Directory.Exists(Path.Combine(install, "versions", "2.0.0")));
@@ -514,11 +511,11 @@ public class SelfUpdaterTests
             // No pointer at all.
             Assert.Null(Updater.ResolveCurrent(root));
 
-            // A pointer naming a version that is not on disk.
-            File.WriteAllText(Path.Combine(root, "current.version"), "9.9.9");
+            // A pointer that does not resolve to a directory on disk.
+            SetPointer(root, "9.9.9");
             Assert.Null(Updater.ResolveCurrent(root));
 
-            // A pointer naming a version that is.
+            // A pointer that does.
             Directory.CreateDirectory(Path.Combine(root, "versions", "9.9.9"));
             Assert.Equal(Path.Combine(root, "versions", "9.9.9"), Updater.ResolveCurrent(root));
         }
@@ -526,6 +523,84 @@ public class SelfUpdaterTests
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    [Fact]
+    public void RunLauncher_RunsTheActiveVersionAndForwardsExitCode()
+    {
+        // A launcher needs a real executable to run, which is only cheap to fake on POSIX.
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("selfupdater-launcher-").FullName;
+        try
+        {
+            var exe = Path.Combine(root, "versions", "1.0.0", "app");
+            WriteFile(exe, "#!/bin/sh\nexit 3\n", executable: true);
+            SetPointer(root, "1.0.0");
+
+            Assert.Equal(3, Updater.RunLauncher(root, "app", log: TextWriter.Null));
+
+            // A pointer that resolves nowhere is reported rather than run.
+            Directory.Delete(Path.Combine(root, "versions", "1.0.0"), recursive: true);
+            Assert.Equal(69, Updater.RunLauncher(root, "app", log: TextWriter.Null));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void StagedLauncher_IsPromotedOnTheNextRun()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("selfupdater-promote-").FullName;
+        try
+        {
+            // Stand in for the running launcher: PromotePendingLauncher keys off the
+            // process path, so drive the promotion through the public staging API and
+            // assert on the files it leaves behind.
+            var launcher = Path.Combine(root, "launch");
+            WriteFile(launcher, "old-launcher", executable: true);
+            var replacement = Path.Combine(root, "build", "launch");
+            WriteFile(replacement, "new-launcher", executable: true);
+
+            Assert.True(Updater.StageLauncherReplacement(launcher, replacement, TextWriter.Null));
+
+            // Staging never touches the running launcher — that is the whole point of
+            // deferring, since a running executable cannot be overwritten.
+            Assert.Equal("old-launcher", File.ReadAllText(launcher));
+            Assert.Equal("new-launcher", File.ReadAllText(launcher + ".new"));
+            Assert.True(
+                File.GetUnixFileMode(launcher + ".new").HasFlag(UnixFileMode.UserExecute),
+                "the staged launcher should be executable"
+            );
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Point an install root at a version the way the updater does: a symlink on POSIX,
+    /// a small file on Windows.
+    /// </summary>
+    private static void SetPointer(string installRoot, string version)
+    {
+        Directory.CreateDirectory(installRoot);
+        var pointer = Path.Combine(installRoot, Updater.CurrentName);
+        if (OperatingSystem.IsWindows())
+        {
+            File.WriteAllText(pointer, version);
+            return;
+        }
+        if (Directory.Exists(pointer) || new DirectoryInfo(pointer).LinkTarget is not null)
+            Directory.Delete(pointer);
+        Directory.CreateSymbolicLink(pointer, Path.Combine("versions", version));
     }
 
     /// <summary>

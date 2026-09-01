@@ -125,8 +125,8 @@ moving a pointer to select the active one:
 
 ```
 <InstallRoot>/
-  current.version      pointer file naming the active version
-  current              symlink to versions/<active> (POSIX only, convenience)
+  current              pointer: a symlink to versions/<active> on POSIX,
+                       or a small file naming it on Windows (current.version)
   versions/1.2.3/      the running build; never touched by an update
   versions/1.2.4/      freshly unpacked
 ```
@@ -142,28 +142,65 @@ var updater = new GitHubUpdater("you", "myapp", new UpdaterOptions
 
 **Nothing in use is ever renamed, deleted, or overwritten.** An update unpacks
 into a `versions/` directory that nothing points at, validates it, and only then
-replaces `current.version` — a single small file, which is the one operation
-every platform can do atomically (`rename()` on POSIX,
-`MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on Windows). An interrupted update
-therefore leaves a junk directory and a completely working app, with no backup
-tree, no journal, and no reconciliation pass to get wrong. Rolling back is
-pointing `current.version` at a version that is still on disk.
+replaces the pointer. An interrupted update therefore leaves a junk directory and
+a completely working app, with no backup tree, no journal, and no reconciliation
+pass to get wrong. Rolling back is pointing at a version that is still on disk.
 
-Resolve the active build at launch:
+There is exactly **one** pointer, and replacing it is the only operation in the
+whole update that has to be atomic:
 
-```csharp
-var dir = Updater.ResolveCurrent(installRoot);   // <root>/versions/1.2.4, or null
+| | Pointer | Replaced with |
+|---|---|---|
+| POSIX | `current` → `versions/<active>` symlink | `rename(2)` |
+| Windows | `current.version`, a file naming the version | `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` |
+
+(The BCL cannot swap a directory symlink — `File.Move` rejects one because
+`File.Exists` is false for it, and `Directory.Move` refuses to overwrite — so the
+POSIX path calls `rename(2)` directly rather than leaving a window where the
+pointer does not exist.)
+
+#### Launching the active version
+
+On **POSIX the pointer is a symlink, so nothing extra is needed**: point whatever
+starts your app at the stable path and it follows updates by itself.
+
+```ini
+ExecStart=/opt/myapp/current/myapp
 ```
 
-The library deliberately does **not** ship a launcher process — that means
-forwarding argv, stdio, exit codes and signals, which is process-supervision work.
-Point whatever already starts your app at the resolved path instead: a systemd
-unit can use `ExecStart=/opt/myapp/current/myapp` and rely on the `current`
-symlink, and a Windows shortcut or service target can be written to the resolved
-version directory.
+**Windows has no unprivileged directory symlink**, so a shortcut or service
+cannot point at a stable path. Ship a launcher: a tiny executable that lives at
+the install root, outside the version directories, and is what shortcuts and
+service definitions point at.
 
-The running executable must live inside a version directory (directly, or via
-`current`); its location relative to that directory is how the staged build's
+```csharp
+// launcher/Program.cs — the whole thing
+return Updater.RunLauncher(AppContext.BaseDirectory, "myapp.exe", args);
+```
+
+`RunLauncher` resolves the pointer, starts that executable inside the active
+version, and returns its exit code. Child stdio is inherited, so console output
+and Ctrl-C behave as if the app had been started directly. It does not supervise
+beyond waiting — kill the launcher and the child keeps running; setting up a
+Windows job object to change that is left to the caller.
+
+Because the launcher lives outside the version directories, a versioned install
+does not replace it. When a release ships a newer one, stage it and it is
+promoted on the next run:
+
+```csharp
+Updater.StageLauncherReplacement(launcherPath, newLauncherPath);
+```
+
+The swap is deferred because a running executable cannot be overwritten — but it
+*can* be renamed, even on Windows, so promotion renames the old launcher aside
+and moves the replacement into place.
+
+`Updater.ResolveCurrent(installRoot)` returns the active version's directory if
+you need to resolve it yourself.
+
+The running executable must live inside a version directory (directly, or via the
+pointer); its location relative to that directory is how the staged build's
 executable is found. Old versions are swept on a best-effort basis after each
 successful install — the running one and the newly active one are always kept,
 and on Windows a directory still in use simply refuses to delete and is swept on

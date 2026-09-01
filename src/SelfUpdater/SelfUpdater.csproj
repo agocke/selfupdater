@@ -5,6 +5,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <!-- Designed to be consumed by single-file / Native AOT apps. -->
     <IsAotCompatible>true</IsAotCompatible>
+    <!-- Required by [LibraryImport]'s source-generated marshalling (the rename(2) call
+         that flips the POSIX version pointer atomically). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <!-- Doc comments are provided for the API surface that matters; don't fail on
          every member (records, enum cases, ctors) lacking one. -->
