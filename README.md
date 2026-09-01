@@ -100,47 +100,87 @@ fetch-then-apply (so it never lists the source twice).
 
 ### The handoff command
 
-`UpdateAsync` downloads + validates the new binary, then launches it with a
-hidden command so the **new** process performs the swap once the old one exits.
-Wire that command up once:
+For **single-file** updates, `UpdateAsync` downloads + validates the new binary,
+then launches it with a hidden command so the **new** process performs the swap
+once the old one exits (a running executable cannot overwrite itself, especially
+on Windows). Wire that command up once:
 
 ```csharp
 // e.g. with System.CommandLine — names come from Updater constants
 // Updater.HandoffVerb ("apply-update"), Updater.DestOption ("--dest"),
-// Updater.PidOption ("--pid"), Updater.RelaunchOption ("--relaunch"),
-// Updater.SourceDirOption ("--source-dir", directory updates only)
+// Updater.PidOption ("--pid"), Updater.RelaunchOption ("--relaunch")
 if (args is [Updater.HandoffVerb, ..])
-{
-    // sourceDir is null for single-file updates; pass it through for directory ones.
-    return Updater.ApplySwap(destPath, oldPid, relaunchArgs: null, sourceDir: sourceDir);
-}
+    return Updater.ApplySwap(destPath, oldPid, relaunchArgs: null);
 ```
 
-### Directory (multi-file) updates
+Versioned installs (below) need no handoff: they never replace anything that is
+in use, so nothing has to wait for the old process to exit.
 
-Some apps are not a single file — a macOS `.app` bundle, or a binary that ships
-sidecar native assets next to it. Set `TargetDirectory` and the engine treats the
-release asset as a `.zip` or `.tar.gz`/`.tgz` containing one top-level directory, and
-replaces the whole tree in place instead of one file:
+### Versioned (multi-file) installs
+
+Some apps are not a single file — a binary that ships sidecar native assets next
+to it, say. Set `InstallRoot` and the engine treats the release asset as a `.zip`
+or `.tar.gz`/`.tgz` archive and installs each version into its own directory,
+moving a pointer to select the active one:
+
+```
+<InstallRoot>/
+  current.version      pointer file naming the active version
+  current              symlink to versions/<active> (POSIX only, convenience)
+  versions/1.2.3/      the running build; never touched by an update
+  versions/1.2.4/      freshly unpacked
+```
 
 ```csharp
 var updater = new GitHubUpdater("you", "myapp", new UpdaterOptions
 {
     AppName = "myapp",
     CurrentVersion = current,
-    // The directory to replace wholesale. The running executable must live inside
-    // it (e.g. MyApp.app/Contents/MacOS/myapp); its location relative to the root is
-    // reused to launch the staged build and to relaunch after the swap.
-    TargetDirectory = bundleRoot,
+    InstallRoot = installRoot,
 });
 ```
+
+**Nothing in use is ever renamed, deleted, or overwritten.** An update unpacks
+into a `versions/` directory that nothing points at, validates it, and only then
+replaces `current.version` — a single small file, which is the one operation
+every platform can do atomically (`rename()` on POSIX,
+`MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on Windows). An interrupted update
+therefore leaves a junk directory and a completely working app, with no backup
+tree, no journal, and no reconciliation pass to get wrong. Rolling back is
+pointing `current.version` at a version that is still on disk.
+
+Resolve the active build at launch:
+
+```csharp
+var dir = Updater.ResolveCurrent(installRoot);   // <root>/versions/1.2.4, or null
+```
+
+The library deliberately does **not** ship a launcher process — that means
+forwarding argv, stdio, exit codes and signals, which is process-supervision work.
+Point whatever already starts your app at the resolved path instead: a systemd
+unit can use `ExecStart=/opt/myapp/current/myapp` and rely on the `current`
+symlink, and a Windows shortcut or service target can be written to the resolved
+version directory.
+
+The running executable must live inside a version directory (directly, or via
+`current`); its location relative to that directory is how the staged build's
+executable is found. Old versions are swept on a best-effort basis after each
+successful install — the running one and the newly active one are always kept,
+and on Windows a directory still in use simply refuses to delete and is swept on
+a later run.
 
 The release asset is named the same way — `{appName}-{version}-{rid}.<ext>` — the
 default convention strips a known archive extension (`.zip`, `.tgz`, `.tar.gz`)
 before matching, and extraction dispatches on that extension (`.tar.gz`/`.tgz` are
-extracted as gzipped tar, everything else as zip). Executable bits inside the archive
-are preserved on extraction, so the swapped-in tree stays runnable. The handoff is
-identical; just forward the `--source-dir` value (above) to `ApplySwap`.
+extracted as gzipped tar, everything else as zip). Executable bits inside the
+archive are preserved, so the installed tree stays runnable.
+
+> **Not for macOS `.app` bundles.** A bundle is an identity, not just a directory:
+> Launch Services, the Dock, `open -a` and TCC grants all key on its path, and it
+> must be signed and notarized as a unit, so versioned directories behind a stub
+> fight the platform. macOS also has a genuinely atomic directory exchange
+> (`renamex_np(..., RENAME_SWAP)`) and a mature framework built on it. Use
+> [Sparkle](https://sparkle-project.org) for Mac app bundles.
 
 ### Private GitHub repos
 

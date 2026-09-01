@@ -354,54 +354,205 @@ public class SelfUpdaterTests
     }
 
     [Fact]
-    public void ApplySwap_DirectoryMode_ReplacesTreeDropsStaleAndPreservesModes()
+    public async Task VersionedInstall_UnpacksNewVersionAndMovesPointer()
     {
-        var root = Directory.CreateTempSubdirectory("selfupdater-swap-").FullName;
+        var root = Directory.CreateTempSubdirectory("selfupdater-versioned-").FullName;
         try
         {
-            var dest = Path.Combine(root, "install", "MyApp.app");
-            var staged = Path.Combine(root, "staged", "MyApp.app");
+            // An existing install running 1.0.0 out of versions/1.0.0.
+            var install = Path.Combine(root, "install");
+            var oldExe = Path.Combine(install, "versions", "1.0.0", "app");
+            WriteFile(oldExe, "old", executable: true);
+            WriteFile(Path.Combine(install, "versions", "1.0.0", "data.bin"), "old-data");
+            File.WriteAllText(Path.Combine(install, "current.version"), "1.0.0");
 
-            // Old install: an executable, a plist, and a stale file the update drops.
-            WriteFile(Path.Combine(dest, "Contents", "MacOS", "app"), "old", executable: true);
-            WriteFile(Path.Combine(dest, "Contents", "Info.plist"), "old-plist");
-            WriteFile(Path.Combine(dest, "Contents", "MacOS", "stale.txt"), "stale");
-
-            // Staged build: new exe contents, a new resource, and no stale file.
-            WriteFile(Path.Combine(staged, "Contents", "MacOS", "app"), "new", executable: true);
-            WriteFile(Path.Combine(staged, "Contents", "Info.plist"), "new-plist");
-            WriteFile(Path.Combine(staged, "Contents", "Resources", "data.bin"), "data");
-
-            var code = Updater.ApplySwap(
-                dest,
-                oldPid: 0,
-                relaunchArgs: null,
-                sourceDir: staged,
-                log: TextWriter.Null
+            var source = StageArchive(root, "app-2.0.0-osx-arm64.zip", "new");
+            var updater = new DirectoryUpdater(
+                source,
+                Options("1.0.0", allowNonSingleFile: true) with
+                {
+                    InstallRoot = install,
+                    TargetPath = oldExe,
+                }
             );
 
-            Assert.Equal(0, code);
-            Assert.Equal("new", File.ReadAllText(Path.Combine(dest, "Contents", "MacOS", "app")));
+            var result = await updater.UpdateAsync();
+
+            Assert.Equal(UpdateOutcome.Staged, result.Outcome);
+            Assert.Equal(V("2.0.0"), result.Version);
+
+            // The new version is unpacked under its own directory...
+            var newExe = Path.Combine(install, "versions", "2.0.0", "app");
+            Assert.Equal("new", File.ReadAllText(newExe));
+            // ...the pointer moved to it...
             Assert.Equal(
-                "new-plist",
-                File.ReadAllText(Path.Combine(dest, "Contents", "Info.plist"))
+                "2.0.0",
+                File.ReadAllText(Path.Combine(install, "current.version")).Trim()
             );
-            Assert.True(File.Exists(Path.Combine(dest, "Contents", "Resources", "data.bin")));
-            // Files present only in the old tree are gone after the swap.
-            Assert.False(File.Exists(Path.Combine(dest, "Contents", "MacOS", "stale.txt")));
-            // No backup directory left behind on success.
-            Assert.False(Directory.Exists(dest + ".bak"));
+            Assert.Equal(
+                Path.Combine(install, "versions", "2.0.0"),
+                Updater.ResolveCurrent(install)
+            );
+            // ...and the running version was never touched.
+            Assert.Equal("old", File.ReadAllText(oldExe));
+            Assert.Equal(
+                "old-data",
+                File.ReadAllText(Path.Combine(install, "versions", "1.0.0", "data.bin"))
+            );
+
+            // No staging directories survive a successful install.
+            Assert.DoesNotContain(
+                Directory.GetDirectories(Path.Combine(install, "versions")),
+                d => Path.GetFileName(d).StartsWith(".staging-", StringComparison.Ordinal)
+            );
 
             if (!OperatingSystem.IsWindows())
             {
-                var mode = File.GetUnixFileMode(Path.Combine(dest, "Contents", "MacOS", "app"));
-                Assert.True(mode.HasFlag(UnixFileMode.UserExecute));
+                Assert.True(
+                    File.GetUnixFileMode(newExe).HasFlag(UnixFileMode.UserExecute),
+                    "the staged executable should keep its executable bit"
+                );
+                // The convenience symlink follows the pointer.
+                var link = new DirectoryInfo(Path.Combine(install, "current"));
+                Assert.Equal(Path.Combine("versions", "2.0.0"), link.LinkTarget);
+                Assert.Equal("new", File.ReadAllText(Path.Combine(link.FullName, "app")));
             }
         }
         finally
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task VersionedInstall_KeepsRunningAndCurrentVersionsAndSweepsTheRest()
+    {
+        var root = Directory.CreateTempSubdirectory("selfupdater-sweep-").FullName;
+        try
+        {
+            var install = Path.Combine(root, "install");
+            // 1.0.0 is what this process "runs" from; 0.9.0 is a leftover nothing uses.
+            var runningExe = Path.Combine(install, "versions", "1.0.0", "app");
+            WriteFile(runningExe, "old", executable: true);
+            WriteFile(Path.Combine(install, "versions", "0.9.0", "app"), "older");
+            Directory.CreateDirectory(Path.Combine(install, "versions", ".staging-leftover"));
+            File.WriteAllText(Path.Combine(install, "current.version"), "1.0.0");
+
+            var source = StageArchive(root, "app-2.0.0-osx-arm64.zip", "new");
+            var updater = new DirectoryUpdater(
+                source,
+                Options("1.0.0", allowNonSingleFile: true) with
+                {
+                    InstallRoot = install,
+                    TargetPath = runningExe,
+                }
+            );
+
+            Assert.Equal(UpdateOutcome.Staged, (await updater.UpdateAsync()).Outcome);
+
+            var versions = Directory
+                .GetDirectories(Path.Combine(install, "versions"))
+                .Select(d => Path.GetFileName(d)!)
+                .Order()
+                .ToArray();
+            // The new version and the running one survive; the stale version and the
+            // abandoned staging directory are swept.
+            Assert.Equal(["1.0.0", "2.0.0"], versions);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task VersionedInstall_BadPayloadLeavesInstallUntouched()
+    {
+        var root = Directory.CreateTempSubdirectory("selfupdater-badpayload-").FullName;
+        try
+        {
+            var install = Path.Combine(root, "install");
+            var oldExe = Path.Combine(install, "versions", "1.0.0", "app");
+            WriteFile(oldExe, "old", executable: true);
+            File.WriteAllText(Path.Combine(install, "current.version"), "1.0.0");
+
+            // An archive that does not contain the expected executable name.
+            var source = StageArchive(root, "app-2.0.0-osx-arm64.zip", "new", exeName: "wrong");
+            var updater = new DirectoryUpdater(
+                source,
+                Options("1.0.0", allowNonSingleFile: true) with
+                {
+                    InstallRoot = install,
+                    TargetPath = oldExe,
+                }
+            );
+
+            var result = await updater.UpdateAsync();
+
+            Assert.Equal(UpdateOutcome.Failed, result.Outcome);
+            // The pointer still names the old version, which is still intact, and the
+            // half-good 2.0.0 directory was cleaned up rather than left to be resolved.
+            Assert.Equal(
+                "1.0.0",
+                File.ReadAllText(Path.Combine(install, "current.version")).Trim()
+            );
+            Assert.Equal("old", File.ReadAllText(oldExe));
+            Assert.False(Directory.Exists(Path.Combine(install, "versions", "2.0.0")));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ResolveCurrent_ReturnsNullWithoutAUsablePointer()
+    {
+        var root = Directory.CreateTempSubdirectory("selfupdater-resolve-").FullName;
+        try
+        {
+            // No pointer at all.
+            Assert.Null(Updater.ResolveCurrent(root));
+
+            // A pointer naming a version that is not on disk.
+            File.WriteAllText(Path.Combine(root, "current.version"), "9.9.9");
+            Assert.Null(Updater.ResolveCurrent(root));
+
+            // A pointer naming a version that is.
+            Directory.CreateDirectory(Path.Combine(root, "versions", "9.9.9"));
+            Assert.Equal(Path.Combine(root, "versions", "9.9.9"), Updater.ResolveCurrent(root));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Write a release archive into a fresh source directory a DirectoryUpdater can list.
+    /// The archive holds a single top-level directory, as a real release bundle does.
+    /// </summary>
+    private static string StageArchive(
+        string root,
+        string archiveName,
+        string exeContent,
+        string exeName = "app"
+    )
+    {
+        var source = Path.Combine(root, "source-" + Path.GetRandomFileName());
+        Directory.CreateDirectory(source);
+
+        var build = Path.Combine(root, "build-" + Path.GetRandomFileName(), "bundle");
+        WriteFile(Path.Combine(build, exeName), exeContent, executable: true);
+        WriteFile(Path.Combine(build, "data.bin"), "new-data");
+
+        ZipFile.CreateFromDirectory(
+            build,
+            Path.Combine(source, archiveName),
+            CompressionLevel.Optimal,
+            includeBaseDirectory: true
+        );
+        return source;
     }
 
     [Theory]

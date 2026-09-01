@@ -31,28 +31,6 @@ internal static class Utilities
         File.SetUnixFileMode(path, mode);
     }
 
-    /// <summary>
-    /// Recursively copy a directory tree, preserving Unix file modes (so executable
-    /// bits inside an app bundle survive the copy). Overwrites existing files.
-    /// </summary>
-    public static void CopyDirectory(string source, string dest)
-    {
-        Directory.CreateDirectory(dest);
-        if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(dest, File.GetUnixFileMode(source));
-
-        foreach (var dir in Directory.GetDirectories(source))
-            CopyDirectory(dir, Path.Combine(dest, Path.GetFileName(dir)));
-
-        foreach (var file in Directory.GetFiles(source))
-        {
-            var target = Path.Combine(dest, Path.GetFileName(file));
-            File.Copy(file, target, overwrite: true);
-            if (!OperatingSystem.IsWindows())
-                File.SetUnixFileMode(target, File.GetUnixFileMode(file));
-        }
-    }
-
     public static async Task<string> ComputeSha256Async(string path, CancellationToken ct)
     {
         await using var stream = File.OpenRead(path);
