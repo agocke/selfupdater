@@ -19,7 +19,7 @@ dotnet add package SelfUpdater
 
 Targets `net10.0`, trim/AOT-compatible, serializes with [Serde.NET](https://github.com/serde-dotnet/serde).
 
-## Two ready-to-use updaters
+## Three ready-to-use updaters
 
 Pick the one that matches where your releases live, hand it an `UpdaterOptions`, and
 call `UpdateAsync`:
@@ -28,8 +28,9 @@ call `UpdateAsync`:
 |---|---|
 | `DirectoryUpdater` | A local folder or network share — LAN/offline/air-gapped rollouts, and tests. Reads the directory's files; the ones matching `{appName}-{version}-{rid}` (or your parser) become releases. Optional `{binary}.sha256` sidecars provide integrity. |
 | `GitHubUpdater` | GitHub Releases. Reads each published asset; the ones matching `{appName}-{version}-{rid}` (or your parser) become releases — the rest are ignored. Public repos need nothing; **private** repos take an `authToken` delegate and download through the authenticated asset API. |
+| `ForgejoUpdater` | A [Forgejo](https://forgejo.org) (or Gitea) instance's Releases, including a self-hosted one. Same naming rules as above, read through the instance's `/api/v1` REST API. Forgejo publishes no asset digest, so integrity comes from `{asset}.sha256` sidecar assets. Takes the same `authToken` delegate for private repos and login-required instances. |
 
-Both share the same engine via a common `Updater` base: a concrete updater only
+All three share the same engine via a common `Updater` base: a concrete updater only
 supplies how to *list* a source's raw artifacts and how to *open* one's bytes — it
 never parses versions, compares them, decides what counts as "new", or picks which
 asset fits the running platform. All of that policy lives in `UpdaterOptions`, which
@@ -218,6 +219,50 @@ archive are preserved, so the installed tree stays runnable.
 > fight the platform. macOS also has a genuinely atomic directory exchange
 > (`renamex_np(..., RENAME_SWAP)`) and a mature framework built on it. Use
 > [Sparkle](https://sparkle-project.org) for Mac app bundles.
+
+### Forgejo / Gitea
+
+`ForgejoUpdater` takes the instance URL on top of owner/repo; everything else is the
+same as `GitHubUpdater`:
+
+```csharp
+var updater = new ForgejoUpdater(
+    instance: new Uri("https://forge.example.internal"),
+    owner: "you", repo: "myapp", options,
+    authToken: ct => Task.FromResult<string?>(myToken)); // omit for public repos
+```
+
+Two differences from GitHub are worth knowing:
+
+- **Checksums are sidecars.** GitHub reports a `digest` per asset; Forgejo reports
+  none, so upload `{assetName}.sha256` next to each build (the same convention
+  `DirectoryUpdater` uses — a bare hash or `sha256sum` output both parse). Without
+  one, the download is not checksum-verified. Sidecars are fetched only for assets
+  matching the configured rid, and a custom `Parser` disables the lookup since the
+  naming it implies is unknown here.
+- **Auth is scoped to the instance.** The token goes out as Forgejo's
+  `Authorization: token …`, and only on requests to the instance host — a Forgejo
+  release asset may be an arbitrary external URL, which never sees your credentials.
+
+Do not use the `releases.rss` feed for this: it carries no asset list, download URLs,
+sizes, or prerelease flag. The REST API is the supported path.
+
+### Updating several binaries from one repo
+
+`AppName` is what selects a build, so two executables published to the same
+repo — a client and a server, say, that may not even live on the same machine —
+update independently. Give each its own updater:
+
+```csharp
+var client = new ForgejoUpdater(instance, "you", "myapp", options with { AppName = "myapp" });
+var server = new ForgejoUpdater(instance, "you", "myapp", options with { AppName = "myapp-server" });
+```
+
+Ship `myapp-1.2.3-linux-arm64.tar.gz` and `myapp-server-1.2.3-linux-arm64.tar.gz` in
+the same release and each side picks up only its own: the `myapp` updater rejects the
+server asset because `server-1.2.3` is not a version, and the `myapp-server` updater
+rejects the client asset on the prefix. Their versions are then free to diverge, so if
+the two speak a protocol to each other, that compatibility is yours to manage.
 
 ### Private GitHub repos
 
