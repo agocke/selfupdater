@@ -68,6 +68,15 @@ internal static class AssetNaming
         };
     }
 
+    /// <summary>
+    /// Whether an asset name targets <paramref name="rid"/> under the default
+    /// convention — i.e. it ends in <c>-{rid}</c>, ignoring any archive extension.
+    /// A cheap prefilter for sources that must do per-asset work (fetching a checksum
+    /// sidecar, say) before the full parse would otherwise discard the asset.
+    /// </summary>
+    public static bool MatchesRid(string rawName, string rid) =>
+        StripArchiveExtension(rawName).EndsWith("-" + rid, StringComparison.Ordinal);
+
     /// <summary>Drop a recognized archive extension (case-insensitive), if present.</summary>
     private static string StripArchiveExtension(string name)
     {

@@ -328,6 +328,185 @@ public class SelfUpdaterTests
     }
 
     [Fact]
+    public async Task ForgejoSource_ListsReleasesForSelectedRidAndSkipsDrafts()
+    {
+        const string json = """
+            [
+              { "tag_name": "v0.4.0", "draft": true,
+                "assets": [ { "name": "app-0.4.0-osx-arm64", "browser_download_url": "https://forge.test/attachments/draft" } ] },
+              {
+                "tag_name": "v0.3.0",
+                "prerelease": true,
+                "assets": [
+                  { "name": "app-0.3.0-osx-arm64", "browser_download_url": "https://forge.test/attachments/a", "size": 42 },
+                  { "name": "app-0.3.0-linux-x64", "browser_download_url": "https://forge.test/attachments/b" }
+                ]
+              },
+              {
+                "tag_name": "v0.2.0",
+                "assets": [
+                  { "name": "app-0.2.0-osx-arm64", "browser_download_url": "https://forge.test/attachments/c" }
+                ]
+              }
+            ]
+            """;
+        var updater = new ForgejoUpdater(
+            new Uri("https://forge.test"),
+            "agocke",
+            "app",
+            Options("0.0.0"),
+            http: StubClient(json)
+        );
+
+        var releases = await updater.GetReleasesAsync();
+
+        // The draft is gone, the other platform is filtered out, the prerelease is flagged.
+        Assert.Equal(2, releases.Count);
+        Assert.DoesNotContain(releases, r => r.Version == V("0.4.0"));
+        var v030 = releases.Single(r => r.Version == V("0.3.0"));
+        Assert.True(v030.IsPrerelease);
+        Assert.Equal("app-0.3.0-osx-arm64", v030.Asset.Name);
+        Assert.Equal("https://forge.test/attachments/a", v030.Asset.Location);
+        Assert.Equal(42, v030.Asset.Size);
+        Assert.False(releases.Single(r => r.Version == V("0.2.0")).IsPrerelease);
+    }
+
+    [Fact]
+    public async Task ForgejoSource_UsesApiV1PathAndTokenAuth()
+    {
+        var seen = new List<HttpRequestMessage>();
+        var updater = new ForgejoUpdater(
+            new Uri("https://forge.test/"),
+            "agocke",
+            "app",
+            Options("0.0.0"),
+            authToken: _ => Task.FromResult<string?>("tok-123"),
+            http: new HttpClient(new CapturingHandler("[]", seen.Add))
+        );
+
+        await updater.GetAssetsAsync(default);
+
+        var req = Assert.Single(seen);
+        // A trailing slash on the instance URL must not produce a doubled path separator.
+        Assert.Equal(
+            "https://forge.test/api/v1/repos/agocke/app/releases?limit=50",
+            req.RequestUri!.ToString()
+        );
+        // Forgejo's scheme is "token", not GitHub's "Bearer".
+        Assert.Equal("token tok-123", req.Headers.Authorization?.ToString());
+    }
+
+    [Fact]
+    public async Task ForgejoSource_ReadsChecksumFromSidecarAsset()
+    {
+        // Forgejo publishes no asset digest, so integrity comes from a {asset}.sha256
+        // sidecar. Only the sidecar for the configured rid is fetched.
+        const string json = """
+            [
+              {
+                "tag_name": "v1.0.0",
+                "assets": [
+                  { "name": "app-1.0.0-osx-arm64", "browser_download_url": "https://forge.test/dl/osx" },
+                  { "name": "app-1.0.0-osx-arm64.sha256", "browser_download_url": "https://forge.test/dl/osx-sum" },
+                  { "name": "app-1.0.0-linux-x64", "browser_download_url": "https://forge.test/dl/linux" },
+                  { "name": "app-1.0.0-linux-x64.sha256", "browser_download_url": "https://forge.test/dl/linux-sum" }
+                ]
+              }
+            ]
+            """;
+        var routed = new RoutingHandler(
+            new Dictionary<string, string>
+            {
+                ["https://forge.test/api/v1/repos/agocke/app/releases?limit=50"] = json,
+                // sha256sum's "<hash>  <filename>" format, not a bare hash.
+                ["https://forge.test/dl/osx-sum"] = "abc123  app-1.0.0-osx-arm64\n",
+                ["https://forge.test/dl/linux-sum"] = "def456  app-1.0.0-linux-x64\n",
+            }
+        );
+        var updater = new ForgejoUpdater(
+            new Uri("https://forge.test"),
+            "agocke",
+            "app",
+            Options("0.0.0"),
+            http: new HttpClient(routed)
+        );
+
+        var assets = await updater.GetAssetsAsync(default);
+
+        // Sidecars are not releases themselves.
+        Assert.Equal(2, assets.Count);
+        Assert.Equal("abc123", assets.Single(a => a.Name.EndsWith("osx-arm64")).Sha256);
+        // The other platform is about to be filtered out; don't spend a request on it.
+        Assert.Null(assets.Single(a => a.Name.EndsWith("linux-x64")).Sha256);
+        Assert.DoesNotContain("https://forge.test/dl/linux-sum", routed.Requested);
+    }
+
+    [Fact]
+    public async Task ForgejoSource_DoesNotSendTokenToExternalAssetUrls()
+    {
+        // A Forgejo release asset may be an arbitrary external URL rather than an
+        // uploaded attachment; the instance's credentials must not follow it there.
+        const string json = """
+            [
+              {
+                "tag_name": "v1.0.0",
+                "assets": [
+                  { "name": "app-1.0.0-osx-arm64", "browser_download_url": "https://cdn.elsewhere/app" }
+                ]
+              }
+            ]
+            """;
+        var seen = new List<HttpRequestMessage>();
+        var updater = new ForgejoUpdater(
+            new Uri("https://forge.test"),
+            "agocke",
+            "app",
+            Options("0.0.0"),
+            authToken: _ => Task.FromResult<string?>("tok-123"),
+            http: new HttpClient(new CapturingHandler(json, seen.Add))
+        );
+
+        var asset = Assert.Single(await updater.GetAssetsAsync(default));
+        await using var _ = await updater.OpenAssetAsync(asset, default);
+
+        Assert.Equal("token tok-123", seen[0].Headers.Authorization?.ToString()); // API call
+        Assert.Null(seen[1].Headers.Authorization); // external download
+    }
+
+    [Fact]
+    public async Task DefaultConvention_SeparatesTwoAppsSharingOneRelease()
+    {
+        // A client and a server published to the same repo update independently: each
+        // updater's AppName is what selects its own assets. This leans on "server-1.0.0"
+        // not parsing as a version, which is what keeps "app" from matching the
+        // "app-server" build sitting right next to it.
+        const string json = """
+            [
+              {
+                "tag_name": "v1.0.0",
+                "assets": [
+                  { "name": "app-1.0.0-osx-arm64.tar.gz", "browser_download_url": "https://dl/client" },
+                  { "name": "app-server-1.0.0-osx-arm64.tar.gz", "browser_download_url": "https://dl/server" }
+                ]
+              }
+            ]
+            """;
+
+        var client = new GitHubUpdater("agocke", "app", Options("0.0.0"), http: StubClient(json));
+        var clientRelease = Assert.Single(await client.GetReleasesAsync());
+        Assert.Equal("https://dl/client", clientRelease.Asset.Location);
+
+        var server = new GitHubUpdater(
+            "agocke",
+            "app",
+            Options("0.0.0", appName: "app-server"),
+            http: StubClient(json)
+        );
+        var serverRelease = Assert.Single(await server.GetReleasesAsync());
+        Assert.Equal("https://dl/server", serverRelease.Asset.Location);
+    }
+
+    [Fact]
     public async Task DefaultConvention_AcceptsArchiveExtensions()
     {
         // Multi-file releases ship as archives; the default convention strips a known
@@ -754,6 +933,29 @@ public class SelfUpdaterTests
                 {
                     Content = new StringContent(body, Encoding.UTF8, "application/json"),
                 }
+            );
+        }
+    }
+
+    // Serves a different body per request URL, and records what was actually asked for.
+    private sealed class RoutingHandler(Dictionary<string, string> bodies) : HttpMessageHandler
+    {
+        public List<string> Requested { get; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken
+        )
+        {
+            var url = request.RequestUri!.ToString();
+            Requested.Add(url);
+            return Task.FromResult(
+                bodies.TryGetValue(url, out var body)
+                    ? new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(body, Encoding.UTF8),
+                    }
+                    : new HttpResponseMessage(HttpStatusCode.NotFound)
             );
         }
     }
