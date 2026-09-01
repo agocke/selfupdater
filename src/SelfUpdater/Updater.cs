@@ -108,16 +108,30 @@ public sealed record UpdaterOptions
     public string? TargetPath { get; init; }
 
     /// <summary>
-    /// Opt into <b>directory (multi-file) updates</b>. When set, the release asset is
-    /// treated as a <c>.zip</c> or <c>.tar.gz</c>/<c>.tgz</c> archive containing a single
-    /// top-level directory, and the whole tree at this path is replaced in place — for
-    /// apps that are not a single file (e.g. a macOS <c>.app</c> bundle, or a binary
-    /// shipping sidecar native assets). The running executable (<see cref="TargetPath"/>
-    /// or the current process) must live inside this directory; its location relative to
-    /// the root is reused to launch the staged build and to relaunch after the swap. When
-    /// <c>null</c> (the default) the updater swaps a single file.
+    /// Opt into <b>versioned (multi-file) installs</b> — for apps that are not a single
+    /// file, e.g. a binary shipping sidecar native assets. When set, the release asset is
+    /// treated as a <c>.zip</c> or <c>.tar.gz</c>/<c>.tgz</c> archive, and this path is the
+    /// install root laid out as:
+    /// <code>
+    /// &lt;InstallRoot&gt;/
+    ///   current.version      pointer file naming the active version
+    ///   current              symlink to versions/&lt;active&gt; (POSIX only, best effort)
+    ///   versions/1.2.3/      the running build; never touched by an update
+    ///   versions/1.2.4/      freshly unpacked
+    /// </code>
+    /// An update unpacks into a new <c>versions/</c> directory that nothing points at and
+    /// then replaces the pointer file, so the live install is never mutated: an
+    /// interrupted update leaves a junk directory and a working app. Nothing in use is
+    /// renamed or deleted, which is also what makes this work on Windows.
+    /// <para>
+    /// The running executable must live inside a version directory (directly, or via
+    /// <c>current</c>); its location relative to that directory is reused to find the
+    /// executable in the staged build. Use <see cref="Updater.ResolveCurrent"/> to
+    /// resolve the active version's directory at launch. When <c>null</c> (the default)
+    /// the updater swaps a single file.
+    /// </para>
     /// </summary>
-    public string? TargetDirectory { get; init; }
+    public string? InstallRoot { get; init; }
 
     /// <summary>
     /// Arguments used to smoke-test a freshly downloaded binary, which must exit 0.
@@ -150,7 +164,7 @@ public sealed record UpdaterOptions
 /// the engine owns naming, platform selection, and the "newest wins" comparison.
 /// </para>
 /// </summary>
-public abstract class Updater
+public abstract partial class Updater
 {
     // Wire contract for the handoff (new-process) side. The host app registers a
     // command/handler with these exact names; keeping them here makes this the
@@ -159,14 +173,6 @@ public abstract class Updater
     public const string DestOption = "--dest";
     public const string PidOption = "--pid";
     public const string RelaunchOption = "--relaunch";
-
-    /// <summary>
-    /// Handoff flag carrying the staged source directory for a directory (multi-file)
-    /// update. Present only when <see cref="UpdaterOptions.TargetDirectory"/> is set;
-    /// its absence selects the single-file swap. The host's <see cref="HandoffVerb"/>
-    /// handler should parse it and forward it to <see cref="ApplySwap"/>.
-    /// </summary>
-    public const string SourceDirOption = "--source-dir";
 
     private readonly UpdaterOptions _options;
     private readonly AssetNameParser _parse;
@@ -251,8 +257,8 @@ public abstract class Updater
             return new UpdateResult(UpdateOutcome.NotSelfContained, release.Version);
         }
 
-        return _options.TargetDirectory is { Length: > 0 } targetDir
-            ? await ApplyDirectoryAsync(release, targetDir, ct).ConfigureAwait(false)
+        return _options.InstallRoot is { Length: > 0 } installRoot
+            ? await ApplyVersionedAsync(release, installRoot, ct).ConfigureAwait(false)
             : await ApplyFileAsync(release, ct).ConfigureAwait(false);
     }
 
@@ -286,50 +292,88 @@ public abstract class Updater
     }
 
     /// <summary>
-    /// Directory (multi-file) swap: download the archive, extract it, validate the
-    /// staged executable, then hand off to replace the whole target directory tree.
+    /// Versioned (multi-file) install: download and extract the archive into a new
+    /// <c>versions/</c> directory, validate it, then move the pointer. The live install
+    /// is never touched, so nothing here needs to be undone if it fails partway.
     /// </summary>
-    private async Task<UpdateResult> ApplyDirectoryAsync(
+    private async Task<UpdateResult> ApplyVersionedAsync(
         Release release,
-        string targetDir,
+        string installRoot,
         CancellationToken ct
     )
     {
-        targetDir = Path.GetFullPath(targetDir);
-        var exePath = _options.TargetPath ?? Utilities.ProcessPath;
-        if (string.IsNullOrEmpty(exePath))
-        {
-            _log.WriteLine("Cannot self-update: unable to determine the target executable path.");
-            return new UpdateResult(UpdateOutcome.Failed, release.Version, "Unknown target path.");
-        }
+        installRoot = Path.GetFullPath(installRoot);
 
-        // The executable must live under the directory we are going to replace; its
-        // relative location is how we find the staged build and relaunch the new one.
-        var relExe = Path.GetRelativePath(targetDir, Path.GetFullPath(exePath));
-        if (relExe.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relExe))
+        // Where the executable sits inside a version directory ("app", "bin/app", ...).
+        // Reused to find the executable in the staged build and to relaunch it.
+        var exePath = _options.TargetPath ?? Utilities.ProcessPath;
+        var relExe = RelativeExePath(installRoot, exePath);
+        if (relExe is null)
         {
             _log.WriteLine(
-                $"Cannot self-update: the running executable is not inside TargetDirectory ({targetDir})."
+                $"Cannot self-update: the running executable is not inside a version directory under {installRoot}."
             );
             return new UpdateResult(
                 UpdateOutcome.Failed,
                 release.Version,
-                "Executable is outside the target directory."
+                "Executable is outside the install root."
             );
         }
 
-        var stagedDir = await DownloadAndExtractAsync(release.Asset, ct).ConfigureAwait(false);
-        if (stagedDir is null)
-            return new UpdateResult(
-                UpdateOutcome.Failed,
-                release.Version,
-                "Download or extraction failed."
-            );
+        var versionsDir = Path.Combine(installRoot, VersionsDirName);
+        var versionDir = Path.Combine(versionsDir, release.Version.ToString());
+        if (Directory.Exists(versionDir))
+        {
+            // A previous attempt at this version left something behind. It cannot be the
+            // running build (that version would not have been fetched), so it is junk.
+            _log.WriteLine($"Discarding an incomplete earlier attempt at {release.Version}.");
+            try
+            {
+                Directory.Delete(versionDir, recursive: true);
+            }
+            catch (Exception e)
+            {
+                _log.WriteLine($"Could not clear {versionDir}: {e.Message}");
+                return new UpdateResult(
+                    UpdateOutcome.Failed,
+                    release.Version,
+                    "Stale version directory."
+                );
+            }
+        }
 
-        var stagedExe = Path.Combine(stagedDir, relExe);
+        // Unpack into a staging directory alongside the version directories, so moving
+        // the build into place is a same-volume rename rather than a copy.
+        Directory.CreateDirectory(versionsDir);
+        var staging = Path.Combine(versionsDir, StagingPrefix + Path.GetRandomFileName());
+        try
+        {
+            var buildRoot = await DownloadAndExtractAsync(release.Asset, staging, ct)
+                .ConfigureAwait(false);
+            if (buildRoot is null)
+                return new UpdateResult(
+                    UpdateOutcome.Failed,
+                    release.Version,
+                    "Download or extraction failed."
+                );
+
+            Directory.Move(buildRoot, versionDir);
+        }
+        catch (Exception e)
+        {
+            _log.WriteLine($"Could not stage {release.Version}: {e.Message}");
+            return new UpdateResult(UpdateOutcome.Failed, release.Version, "Staging failed.");
+        }
+        finally
+        {
+            TryDelete(staging);
+        }
+
+        var stagedExe = Path.Combine(versionDir, relExe);
         if (!File.Exists(stagedExe))
         {
             _log.WriteLine($"Staged build does not contain the expected executable ({relExe}).");
+            TryDelete(versionDir);
             return new UpdateResult(
                 UpdateOutcome.Failed,
                 release.Version,
@@ -340,14 +384,30 @@ public abstract class Updater
             Utilities.MakeExecutable(stagedExe);
 
         if (!await ValidateAsync(stagedExe, ct).ConfigureAwait(false))
+        {
+            TryDelete(versionDir);
             return new UpdateResult(UpdateOutcome.Failed, release.Version, "Validation failed.");
+        }
 
-        if (!LaunchHandoff(stagedExe, targetDir, stagedDir))
+        // The one operation that has to be atomic, and the only one that changes what
+        // the app resolves to. Everything above this line is invisible to the install.
+        if (!SetCurrent(installRoot, release.Version.ToString(), _log))
+        {
+            TryDelete(versionDir);
             return new UpdateResult(
                 UpdateOutcome.Failed,
                 release.Version,
-                "Could not launch the handoff process."
+                "Could not update the version pointer."
             );
+        }
+
+        _log.WriteLine($"Installed {release.Version}; {CurrentName} now points at it.");
+        SweepOldVersions(installRoot, release.Version.ToString(), exePath, _log);
+
+        // No handoff here: nothing in use was replaced, so the new build can simply be
+        // started with the arguments this process was given.
+        if (_options.Relaunch)
+            Relaunch(stagedExe, Environment.GetCommandLineArgs()[1..], _log);
 
         return new UpdateResult(UpdateOutcome.Staged, release.Version);
     }
@@ -363,6 +423,398 @@ public abstract class Updater
         if (release is null)
             return new UpdateResult(UpdateOutcome.UpToDate);
         return await ApplyAsync(release, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Name of the pointer at the install root that selects the active version. On POSIX
+    /// this is a <b>symlink</b> to the version directory, flipped with <c>rename(2)</c>;
+    /// on Windows, where symlinks need admin, it is a small file naming the version,
+    /// replaced with <c>MoveFileEx(MOVEFILE_REPLACE_EXISTING)</c>. Either way it is one
+    /// pointer, replaced atomically — never two representations that can disagree.
+    /// </summary>
+    public static string CurrentName => OperatingSystem.IsWindows() ? "current.version" : "current";
+
+    private const string VersionsDirName = "versions";
+    private const string StagingPrefix = ".staging-";
+
+    /// <summary>
+    /// The directory holding the active version of a versioned install, or <c>null</c>
+    /// when the install root has no usable pointer. See <see cref="UpdaterOptions.InstallRoot"/>
+    /// for the layout.
+    /// <para>
+    /// On POSIX you rarely need this: the pointer is a symlink, so a launcher can simply
+    /// use <c>&lt;InstallRoot&gt;/current/app</c> as a stable path (a systemd
+    /// <c>ExecStart=</c>, say) and never call into this library. It exists mainly for
+    /// Windows, where <see cref="RunLauncher"/> uses it.
+    /// </para>
+    /// </summary>
+    public static string? ResolveCurrent(string installRoot)
+    {
+        try
+        {
+            var pointer = Path.Combine(installRoot, CurrentName);
+            if (!OperatingSystem.IsWindows())
+            {
+                // The symlink is the pointer; resolve it rather than reading anything.
+                var info = new DirectoryInfo(pointer);
+                return info.LinkTarget is not null && info.Exists
+                    ? info.ResolveLinkTarget(true)?.FullName
+                    : null;
+            }
+
+            if (!File.Exists(pointer))
+                return null;
+            var version = File.ReadAllText(pointer).Trim();
+            if (version.Length == 0)
+                return null;
+            var dir = Path.Combine(installRoot, VersionsDirName, version);
+            return Directory.Exists(dir) ? dir : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Where <paramref name="exePath"/> sits relative to its version directory, or
+    /// <c>null</c> when it is not inside the install at all. Both launch paths are
+    /// accepted: straight out of <c>versions/&lt;v&gt;</c>, or through the pointer.
+    /// </summary>
+    private static string? RelativeExePath(string installRoot, string? exePath)
+    {
+        if (string.IsNullOrEmpty(exePath))
+            return null;
+        var full = Path.GetFullPath(exePath);
+
+        var bases = new List<string> { Path.Combine(installRoot, CurrentName) };
+        var versionsDir = Path.Combine(installRoot, VersionsDirName);
+        if (Directory.Exists(versionsDir))
+            bases.AddRange(Directory.GetDirectories(versionsDir));
+
+        foreach (var dir in bases)
+        {
+            var rel = Path.GetRelativePath(dir, full);
+            if (
+                !Path.IsPathRooted(rel)
+                && rel != ".."
+                && !rel.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            )
+            {
+                return rel;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Point the install at <paramref name="version"/>, atomically: a reader sees either
+    /// the old version or the new one, never neither. This is the only operation in an
+    /// update that has to be atomic, and the only one that changes what the app resolves
+    /// to.
+    /// </summary>
+    private static bool SetCurrent(string installRoot, string version, TextWriter log)
+    {
+        var pointer = Path.Combine(installRoot, CurrentName);
+        var tmp = pointer + ".tmp";
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                File.WriteAllText(tmp, version);
+                File.Move(tmp, pointer, overwrite: true);
+                return true;
+            }
+
+            // Refuse to replace a real directory that happens to sit at the pointer's
+            // name — that is someone else's data, not a pointer we own.
+            var existing = new DirectoryInfo(pointer);
+            if (existing.Exists && existing.LinkTarget is null)
+            {
+                log.WriteLine(
+                    $"{CurrentName} is a real directory, not a symlink; refusing to replace it."
+                );
+                return false;
+            }
+
+            TryDelete(tmp);
+            Directory.CreateSymbolicLink(tmp, Path.Combine(VersionsDirName, version));
+            // rename(2) replaces the existing link in one step. The BCL cannot do this:
+            // File.Move rejects a directory symlink (File.Exists is false for one) and
+            // Directory.Move refuses to overwrite, so both would leave a window where the
+            // pointer does not exist.
+            if (Rename(tmp, pointer) != 0)
+            {
+                var err = Marshal.GetLastPInvokeError();
+                log.WriteLine($"Could not move the {CurrentName} symlink: errno {err}.");
+                TryDelete(tmp);
+                return false;
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            log.WriteLine($"Could not update {CurrentName}: {e.Message}");
+            TryDelete(tmp);
+            return false;
+        }
+    }
+
+    [LibraryImport(
+        "libc",
+        EntryPoint = "rename",
+        SetLastError = true,
+        StringMarshalling = StringMarshalling.Utf8
+    )]
+    private static partial int Rename(string oldPath, string newPath);
+
+    /// <summary>
+    /// Suffix of a staged launcher replacement, promoted by <see cref="RunLauncher"/> on
+    /// its next run. Windows cannot overwrite a running executable, but it <i>can</i>
+    /// rename one, which is what makes the promotion possible.
+    /// </summary>
+    private const string PendingSuffix = ".new";
+
+    /// <summary>Suffix of the outgoing launcher, swept once nothing is running it.</summary>
+    private const string SupersededSuffix = ".old";
+
+    /// <summary>
+    /// Run the active version's executable, as a launcher sitting at a stable path
+    /// outside the version directories. Promotes a staged launcher replacement first (see
+    /// <see cref="StageLauncherReplacement"/>), resolves the pointer, then starts
+    /// <paramref name="relativeExePath"/> inside the active version and waits for it,
+    /// returning its exit code.
+    /// <para>
+    /// This exists for <b>Windows</b>, which has no unprivileged directory symlink, so a
+    /// shortcut or service cannot point at a stable path that follows updates. On POSIX
+    /// the pointer already is a symlink and a launcher is usually redundant — point
+    /// systemd at <c>&lt;InstallRoot&gt;/current/app</c> instead of adding a process.
+    /// </para>
+    /// <para>
+    /// Child stdio is inherited, so console output and Ctrl-C work as if the app had been
+    /// started directly. The launcher does not supervise beyond waiting: if the launcher
+    /// process is killed the child keeps running (a Windows job object would be needed to
+    /// change that, which this deliberately does not set up).
+    /// </para>
+    /// </summary>
+    /// <param name="installRoot">The install root, laid out per <see cref="UpdaterOptions.InstallRoot"/>.</param>
+    /// <param name="relativeExePath">Executable to run, relative to the version directory (e.g. <c>app.exe</c>).</param>
+    /// <param name="args">Arguments forwarded to the app.</param>
+    /// <param name="log">Where to report resolution failures; defaults to <see cref="Console.Error"/>.</param>
+    /// <returns>The app's exit code, or a non-zero code if it could not be started.</returns>
+    public static int RunLauncher(
+        string installRoot,
+        string relativeExePath,
+        IReadOnlyList<string>? args = null,
+        TextWriter? log = null
+    )
+    {
+        log ??= Console.Error;
+        installRoot = Path.GetFullPath(installRoot);
+
+        PromotePendingLauncher(log);
+
+        var dir = ResolveCurrent(installRoot);
+        if (dir is null)
+        {
+            log.WriteLine(
+                $"No active version: {Path.Combine(installRoot, CurrentName)} is missing or does not resolve."
+            );
+            return 69; // EX_UNAVAILABLE
+        }
+
+        var exe = Path.Combine(dir, relativeExePath);
+        if (!File.Exists(exe))
+        {
+            log.WriteLine(
+                $"Active version {Path.GetFileName(dir)} does not contain {relativeExePath}."
+            );
+            return 69;
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo { FileName = exe, UseShellExecute = false };
+            foreach (var a in args ?? [])
+                psi.ArgumentList.Add(a);
+
+            using var child = Process.Start(psi);
+            if (child is null)
+            {
+                log.WriteLine($"Could not start {exe}.");
+                return 70; // EX_SOFTWARE
+            }
+            child.WaitForExit();
+            return child.ExitCode;
+        }
+        catch (Exception e)
+        {
+            log.WriteLine($"Could not start {exe}: {e.Message}");
+            return 70;
+        }
+    }
+
+    /// <summary>
+    /// Stage a replacement for the launcher at <paramref name="launcherPath"/>, to be
+    /// promoted the next time <see cref="RunLauncher"/> runs. Call this when a release
+    /// ships a newer launcher; the launcher itself lives outside the version directories,
+    /// so a versioned install does not replace it.
+    /// <para>
+    /// The swap is deferred because a running executable cannot be overwritten. It can be
+    /// <i>renamed</i>, though, even on Windows, which is what promotion relies on.
+    /// </para>
+    /// </summary>
+    public static bool StageLauncherReplacement(
+        string launcherPath,
+        string newLauncherPath,
+        TextWriter? log = null
+    )
+    {
+        log ??= Console.Error;
+        try
+        {
+            File.Copy(newLauncherPath, launcherPath + PendingSuffix, overwrite: true);
+            if (!OperatingSystem.IsWindows())
+                Utilities.MakeExecutable(launcherPath + PendingSuffix);
+            return true;
+        }
+        catch (Exception e)
+        {
+            log.WriteLine($"Could not stage a launcher replacement: {e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Promote a staged launcher, if one is waiting: rename the running launcher aside
+    /// and move the replacement into its place. The promoted binary takes effect on the
+    /// <i>next</i> run — this process is already the old image — so this is deliberately
+    /// not followed by a re-exec. Also sweeps a superseded launcher left by an earlier
+    /// promotion, which only succeeds once nothing is running it.
+    /// </summary>
+    private static void PromotePendingLauncher(TextWriter log)
+    {
+        var self = Utilities.ProcessPath;
+        if (string.IsNullOrEmpty(self))
+            return;
+
+        TryDelete(self + SupersededSuffix);
+
+        var pending = self + PendingSuffix;
+        if (!File.Exists(pending))
+            return;
+
+        try
+        {
+            // Renaming a running executable is allowed (deleting one is not), so the old
+            // image gets out of the way without disturbing this process.
+            File.Move(self, self + SupersededSuffix, overwrite: true);
+            File.Move(pending, self, overwrite: true);
+            log.WriteLine("Promoted a staged launcher; it takes effect on the next run.");
+        }
+        catch (Exception e)
+        {
+            log.WriteLine($"Could not promote the staged launcher: {e.Message}");
+            // Put the old launcher back if the second move never happened.
+            if (!File.Exists(self) && File.Exists(self + SupersededSuffix))
+                TryMove(self + SupersededSuffix, self);
+        }
+    }
+
+    private static void TryMove(string from, string to)
+    {
+        try
+        {
+            File.Move(from, to, overwrite: true);
+        }
+        catch (Exception)
+        {
+            // Best effort.
+        }
+    }
+
+    /// <summary>
+    /// Delete version directories that are neither the newly active one nor the one the
+    /// running process lives in, plus any leftover staging directories. Entirely best
+    /// effort: on Windows a directory still in use simply refuses to delete, which is the
+    /// wanted behaviour — it gets swept on a later run instead.
+    /// </summary>
+    private static void SweepOldVersions(
+        string installRoot,
+        string keepVersion,
+        string? exePath,
+        TextWriter log
+    )
+    {
+        var versionsDir = Path.Combine(installRoot, VersionsDirName);
+        if (!Directory.Exists(versionsDir))
+            return;
+
+        var running = RunningVersionDir(installRoot, exePath);
+        var keep = Path.Combine(versionsDir, keepVersion);
+
+        foreach (var dir in Directory.GetDirectories(versionsDir))
+        {
+            var name = Path.GetFileName(dir);
+            if (!name.StartsWith(StagingPrefix, StringComparison.Ordinal))
+            {
+                if (PathsEqual(dir, keep) || (running is not null && PathsEqual(dir, running)))
+                    continue;
+            }
+            if (!TryDelete(dir))
+                log.WriteLine($"Left {name} in place (still in use).");
+        }
+    }
+
+    /// <summary>
+    /// The version directory <paramref name="exePath"/> lives in, if any. Passed in
+    /// rather than read from the process so the sweep honours
+    /// <see cref="UpdaterOptions.TargetPath"/> — the running build must survive the
+    /// sweep even though the pointer no longer names it.
+    /// </summary>
+    private static string? RunningVersionDir(string installRoot, string? exePath)
+    {
+        var exe = exePath;
+        if (string.IsNullOrEmpty(exe))
+            return null;
+        var versionsDir = Path.Combine(installRoot, VersionsDirName);
+        if (!Directory.Exists(versionsDir))
+            return null;
+
+        var full = Path.GetFullPath(exe);
+        foreach (var dir in Directory.GetDirectories(versionsDir))
+        {
+            var rel = Path.GetRelativePath(dir, full);
+            if (!Path.IsPathRooted(rel) && !rel.StartsWith("..", StringComparison.Ordinal))
+                return dir;
+        }
+        return null;
+    }
+
+    private static bool PathsEqual(string a, string b) =>
+        string.Equals(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(a)),
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(b)),
+            OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal
+        );
+
+    /// <summary>Delete a file or directory, reporting whether it is gone. Never throws.</summary>
+    private static bool TryDelete(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+            else if (File.Exists(path))
+                File.Delete(path);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private static Release? Newest(IReadOnlyList<Release> releases, Func<Release, bool>? filter)
@@ -403,14 +855,18 @@ public abstract class Updater
     }
 
     /// <summary>
-    /// Download the release archive, verify its checksum, and extract it to a staging
-    /// directory. Returns the staged build root — the single top-level directory inside
-    /// the archive (e.g. <c>Bower.app</c>), or the extraction directory itself when the
-    /// archive has no single wrapping directory — or <c>null</c> on failure.
+    /// Download the release archive, verify its checksum, and extract it into
+    /// <paramref name="tempDir"/>. Returns the staged build root — the single top-level
+    /// directory inside the archive, or the extraction directory itself when the archive
+    /// has no single wrapping directory — or <c>null</c> on failure.
     /// </summary>
-    private async Task<string?> DownloadAndExtractAsync(SourceAsset asset, CancellationToken ct)
+    private async Task<string?> DownloadAndExtractAsync(
+        SourceAsset asset,
+        string tempDir,
+        CancellationToken ct
+    )
     {
-        var tempDir = NewStagingDir();
+        Directory.CreateDirectory(tempDir);
         // Keep the asset's own file name so extraction can dispatch on its extension.
         var fileName = Path.GetFileName(asset.Name);
         if (string.IsNullOrEmpty(fileName))
@@ -555,7 +1011,7 @@ public abstract class Updater
         }
     }
 
-    private bool LaunchHandoff(string stagedPath, string target, string? sourceDir = null)
+    private bool LaunchHandoff(string stagedPath, string target)
     {
         _log.WriteLine($"Staged update ready; handing off to replace {target}.");
         var psi = new ProcessStartInfo
@@ -570,11 +1026,6 @@ public abstract class Updater
                 Environment.ProcessId.ToString(),
             },
         };
-        if (sourceDir is not null)
-        {
-            psi.ArgumentList.Add(SourceDirOption);
-            psi.ArgumentList.Add(sourceDir);
-        }
         if (_options.Relaunch)
             psi.ArgumentList.Add(RelaunchOption);
 
@@ -582,33 +1033,26 @@ public abstract class Updater
     }
 
     /// <summary>
-    /// The handoff (new-process) side of the swap. Runs from the freshly staged build:
-    /// waits for the previous process to exit, replaces the target in place, and
-    /// optionally relaunches. Wire this up in your entry point under
-    /// <see cref="HandoffVerb"/>.
+    /// The handoff (new-process) side of the single-file swap. Runs from the freshly
+    /// staged binary: waits for the previous process to exit, copies itself over
+    /// <paramref name="destPath"/>, and optionally relaunches. Wire this up in your entry
+    /// point under <see cref="HandoffVerb"/>.
     /// <para>
-    /// When <paramref name="sourceDir"/> is <c>null</c> this performs a single-file
-    /// swap (copy the running binary over <paramref name="destPath"/>). When set — for
-    /// a directory (multi-file) update — <paramref name="destPath"/> is a directory and
-    /// its whole tree is replaced with <paramref name="sourceDir"/>; relaunch targets
-    /// the executable at the same relative location inside the swapped tree.
+    /// Versioned installs (<see cref="UpdaterOptions.InstallRoot"/>) need no handoff at
+    /// all: they never replace a file that is in use, so there is nothing that has to
+    /// wait for the old process to exit.
     /// </para>
     /// </summary>
     public static int ApplySwap(
         string destPath,
         int oldPid,
         IReadOnlyList<string>? relaunchArgs = null,
-        string? sourceDir = null,
         TextWriter? log = null
     )
     {
         log ??= Console.Out;
-
         WaitForExit(oldPid, log);
-
-        return sourceDir is { Length: > 0 }
-            ? ApplyDirectorySwap(destPath, sourceDir, relaunchArgs, log)
-            : ApplyFileSwap(destPath, relaunchArgs, log);
+        return ApplyFileSwap(destPath, relaunchArgs, log);
     }
 
     private static void WaitForExit(int oldPid, TextWriter log)
@@ -683,90 +1127,6 @@ public abstract class Updater
 
         log.WriteLine($"Updated in place: {destPath}");
         Relaunch(destPath, relaunchArgs, log);
-        return 0;
-    }
-
-    private static int ApplyDirectorySwap(
-        string destDir,
-        string sourceDir,
-        IReadOnlyList<string>? relaunchArgs,
-        TextWriter log
-    )
-    {
-        destDir = Path.GetFullPath(destDir);
-        sourceDir = Path.GetFullPath(sourceDir);
-
-        // The running process is expected to live inside sourceDir; reuse its relative
-        // location to find the executable to relaunch inside the swapped-in tree. If it
-        // does not (the relative path escapes sourceDir or stays rooted), we cannot know
-        // what to launch in the new tree, so skip relaunch rather than touch a path
-        // outside destDir.
-        var processPath = Utilities.ProcessPath;
-        string? relExe = null;
-        if (!string.IsNullOrEmpty(processPath))
-        {
-            var rel = Path.GetRelativePath(sourceDir, Path.GetFullPath(processPath));
-            if (
-                !Path.IsPathRooted(rel)
-                && rel != ".."
-                && !rel.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            )
-            {
-                relExe = rel;
-            }
-        }
-
-        var backup =
-            destDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".bak";
-        try
-        {
-            if (Directory.Exists(backup))
-                Directory.Delete(backup, recursive: true);
-
-            // Move the old tree aside, then copy the staged tree in. Copy (rather than
-            // move) so the swap works across volumes and the still-running staged image
-            // stays valid; the temp staging dir is reclaimed by the OS later.
-            if (Directory.Exists(destDir))
-                Directory.Move(destDir, backup);
-
-            Utilities.CopyDirectory(sourceDir, destDir);
-
-            if (Directory.Exists(backup))
-            {
-                try
-                {
-                    Directory.Delete(backup, recursive: true);
-                }
-                catch
-                { /* leftover .bak is harmless; leave it for next run */
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            log.WriteLine($"Swap failed: {e.Message}");
-            if (Directory.Exists(backup) && !Directory.Exists(destDir))
-            {
-                try
-                {
-                    Directory.Move(backup, destDir);
-                }
-                catch
-                { /* best effort */
-                }
-            }
-            return 1;
-        }
-
-        log.WriteLine($"Updated in place: {destDir}");
-
-        if (relExe is not null)
-        {
-            var exe = Path.Combine(destDir, relExe);
-            if (!OperatingSystem.IsWindows() && File.Exists(exe))
-                Utilities.MakeExecutable(exe);
-            Relaunch(exe, relaunchArgs, log);
-        }
         return 0;
     }
 

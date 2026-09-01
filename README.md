@@ -100,47 +100,124 @@ fetch-then-apply (so it never lists the source twice).
 
 ### The handoff command
 
-`UpdateAsync` downloads + validates the new binary, then launches it with a
-hidden command so the **new** process performs the swap once the old one exits.
-Wire that command up once:
+For **single-file** updates, `UpdateAsync` downloads + validates the new binary,
+then launches it with a hidden command so the **new** process performs the swap
+once the old one exits (a running executable cannot overwrite itself, especially
+on Windows). Wire that command up once:
 
 ```csharp
 // e.g. with System.CommandLine — names come from Updater constants
 // Updater.HandoffVerb ("apply-update"), Updater.DestOption ("--dest"),
-// Updater.PidOption ("--pid"), Updater.RelaunchOption ("--relaunch"),
-// Updater.SourceDirOption ("--source-dir", directory updates only)
+// Updater.PidOption ("--pid"), Updater.RelaunchOption ("--relaunch")
 if (args is [Updater.HandoffVerb, ..])
-{
-    // sourceDir is null for single-file updates; pass it through for directory ones.
-    return Updater.ApplySwap(destPath, oldPid, relaunchArgs: null, sourceDir: sourceDir);
-}
+    return Updater.ApplySwap(destPath, oldPid, relaunchArgs: null);
 ```
 
-### Directory (multi-file) updates
+Versioned installs (below) need no handoff: they never replace anything that is
+in use, so nothing has to wait for the old process to exit.
 
-Some apps are not a single file — a macOS `.app` bundle, or a binary that ships
-sidecar native assets next to it. Set `TargetDirectory` and the engine treats the
-release asset as a `.zip` or `.tar.gz`/`.tgz` containing one top-level directory, and
-replaces the whole tree in place instead of one file:
+### Versioned (multi-file) installs
+
+Some apps are not a single file — a binary that ships sidecar native assets next
+to it, say. Set `InstallRoot` and the engine treats the release asset as a `.zip`
+or `.tar.gz`/`.tgz` archive and installs each version into its own directory,
+moving a pointer to select the active one:
+
+```
+<InstallRoot>/
+  current              pointer: a symlink to versions/<active> on POSIX,
+                       or a small file naming it on Windows (current.version)
+  versions/1.2.3/      the running build; never touched by an update
+  versions/1.2.4/      freshly unpacked
+```
 
 ```csharp
 var updater = new GitHubUpdater("you", "myapp", new UpdaterOptions
 {
     AppName = "myapp",
     CurrentVersion = current,
-    // The directory to replace wholesale. The running executable must live inside
-    // it (e.g. MyApp.app/Contents/MacOS/myapp); its location relative to the root is
-    // reused to launch the staged build and to relaunch after the swap.
-    TargetDirectory = bundleRoot,
+    InstallRoot = installRoot,
 });
 ```
+
+**Nothing in use is ever renamed, deleted, or overwritten.** An update unpacks
+into a `versions/` directory that nothing points at, validates it, and only then
+replaces the pointer. An interrupted update therefore leaves a junk directory and
+a completely working app, with no backup tree, no journal, and no reconciliation
+pass to get wrong. Rolling back is pointing at a version that is still on disk.
+
+There is exactly **one** pointer, and replacing it is the only operation in the
+whole update that has to be atomic:
+
+| | Pointer | Replaced with |
+|---|---|---|
+| POSIX | `current` → `versions/<active>` symlink | `rename(2)` |
+| Windows | `current.version`, a file naming the version | `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` |
+
+(The BCL cannot swap a directory symlink — `File.Move` rejects one because
+`File.Exists` is false for it, and `Directory.Move` refuses to overwrite — so the
+POSIX path calls `rename(2)` directly rather than leaving a window where the
+pointer does not exist.)
+
+#### Launching the active version
+
+On **POSIX the pointer is a symlink, so nothing extra is needed**: point whatever
+starts your app at the stable path and it follows updates by itself.
+
+```ini
+ExecStart=/opt/myapp/current/myapp
+```
+
+**Windows has no unprivileged directory symlink**, so a shortcut or service
+cannot point at a stable path. Ship a launcher: a tiny executable that lives at
+the install root, outside the version directories, and is what shortcuts and
+service definitions point at.
+
+```csharp
+// launcher/Program.cs — the whole thing
+return Updater.RunLauncher(AppContext.BaseDirectory, "myapp.exe", args);
+```
+
+`RunLauncher` resolves the pointer, starts that executable inside the active
+version, and returns its exit code. Child stdio is inherited, so console output
+and Ctrl-C behave as if the app had been started directly. It does not supervise
+beyond waiting — kill the launcher and the child keeps running; setting up a
+Windows job object to change that is left to the caller.
+
+Because the launcher lives outside the version directories, a versioned install
+does not replace it. When a release ships a newer one, stage it and it is
+promoted on the next run:
+
+```csharp
+Updater.StageLauncherReplacement(launcherPath, newLauncherPath);
+```
+
+The swap is deferred because a running executable cannot be overwritten — but it
+*can* be renamed, even on Windows, so promotion renames the old launcher aside
+and moves the replacement into place.
+
+`Updater.ResolveCurrent(installRoot)` returns the active version's directory if
+you need to resolve it yourself.
+
+The running executable must live inside a version directory (directly, or via the
+pointer); its location relative to that directory is how the staged build's
+executable is found. Old versions are swept on a best-effort basis after each
+successful install — the running one and the newly active one are always kept,
+and on Windows a directory still in use simply refuses to delete and is swept on
+a later run.
 
 The release asset is named the same way — `{appName}-{version}-{rid}.<ext>` — the
 default convention strips a known archive extension (`.zip`, `.tgz`, `.tar.gz`)
 before matching, and extraction dispatches on that extension (`.tar.gz`/`.tgz` are
-extracted as gzipped tar, everything else as zip). Executable bits inside the archive
-are preserved on extraction, so the swapped-in tree stays runnable. The handoff is
-identical; just forward the `--source-dir` value (above) to `ApplySwap`.
+extracted as gzipped tar, everything else as zip). Executable bits inside the
+archive are preserved, so the installed tree stays runnable.
+
+> **Not for macOS `.app` bundles.** A bundle is an identity, not just a directory:
+> Launch Services, the Dock, `open -a` and TCC grants all key on its path, and it
+> must be signed and notarized as a unit, so versioned directories behind a stub
+> fight the platform. macOS also has a genuinely atomic directory exchange
+> (`renamex_np(..., RENAME_SWAP)`) and a mature framework built on it. Use
+> [Sparkle](https://sparkle-project.org) for Mac app bundles.
 
 ### Private GitHub repos
 
